@@ -1,11 +1,12 @@
 services:
   cloudflare-bypass:
-    image: ghcr.io/sarperavci/cloudflarebypassforscraping:latest
+    build: .
     container_name: cloudflare-bypass
     ports:
       - "8005:8005"
     environment:
       - WORKERS=3
+      - API_TOKEN=${API_TOKEN:?API_TOKEN must be set in .env or environment}
     deploy:
       resources:
         limits:
