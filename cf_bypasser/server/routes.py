@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -5,7 +6,7 @@ import time
 import json
 import secrets
 from contextlib import asynccontextmanager
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, Any, Dict
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
@@ -14,7 +15,8 @@ from bs4 import BeautifulSoup
 
 from cf_bypasser.core.bypasser import CamoufoxBypasser
 from cf_bypasser.core.mirror import RequestMirror
-from cf_bypasser.server.models import ErrorResponse
+from cf_bypasser.server.models import ErrorResponse, ZonapropBatchRequest
+from cf_bypasser.utils.misc import md5_hash
 
 # Global instances
 global_bypasser = None
@@ -79,8 +81,178 @@ def verify_token(x_api_token: Optional[str] = Header(None)) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Token header")
 
 
+def extract_preloaded_state(html_content: str) -> Any:
+    """Extract and parse window.__PRELOADED_STATE__ from a ZonaProp page.
+
+    Raises ValueError if the marker or valid JSON cannot be found.
+    """
+    soup = BeautifulSoup(html_content, 'lxml')
+
+    script_tag = soup.find('script', id="preloadedData")
+    if not script_tag:
+        raise ValueError("No script tag found with id='preloadedData' in the page")
+
+    script_text = script_tag.text.strip()
+
+    preloaded_state_marker = 'window.__PRELOADED_STATE__ = '
+    start_index = script_text.find(preloaded_state_marker)
+    if start_index == -1:
+        raise ValueError("window.__PRELOADED_STATE__ marker not found in script tag")
+
+    json_start = start_index + len(preloaded_state_marker)
+    json_text = script_text[json_start:].strip()
+
+    json_text_cleaned = json_text[:-1] if json_text.endswith(';') else json_text
+    try:
+        return json.loads(json_text_cleaned)
+    except json.JSONDecodeError as e:
+        # Fallback: walk braces to find the end of the first JSON object
+        brace_count = 0
+        json_end = 0
+        for i, char in enumerate(json_text):
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    json_end = i + 1
+                    break
+        if json_end > 0:
+            return json.loads(json_text[:json_end])
+        raise ValueError(f"Failed to extract valid JSON: {e}")
+
+
+def split_path_query(path_with_query: str) -> tuple[str, str]:
+    """Split 'path?query' into ('/path', 'query'). Leading slash is normalized."""
+    if '?' in path_with_query:
+        path, query = path_with_query.split('?', 1)
+    else:
+        path, query = path_with_query, ''
+    path = path.lstrip('/')
+    return (f"/{path}" if path else "/", query)
+
+
 def setup_routes(app: FastAPI):
     """Setup routes for the FastAPI application. Only /zonaprop is exposed."""
+
+    @app.post("/zonaprop-batch", dependencies=[Depends(verify_token)])
+    async def zonaprop_batch(request: Request, payload: ZonapropBatchRequest):
+        """Fetch many ZonaProp pages in parallel, reusing a single cf_clearance.
+
+        The Cloudflare clearance cookie is generated once (cached), then all pages
+        are fetched concurrently with curl_cffi up to `concurrency` at a time.
+
+        Required Headers:
+        - X-API-Token, x-hostname
+        Optional Headers:
+        - x-proxy, x-bypass-cache
+        """
+        start_time = time.time()
+        headers = dict(request.headers)
+
+        hostname = None
+        proxy = None
+        bypass_cache = False
+        for key, value in headers.items():
+            key_lower = key.lower()
+            if key_lower == 'x-hostname':
+                hostname = value
+            elif key_lower == 'x-proxy':
+                proxy = value
+            elif key_lower == 'x-bypass-cache':
+                bypass_cache = value.lower() in ('true', '1', 'yes', 'on')
+
+        if not hostname:
+            raise HTTPException(status_code=400, detail="x-hostname header is required")
+        if not is_safe_url(f"https://{hostname}"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or unsafe hostname - localhost and private IPs are not allowed",
+            )
+        if proxy and not proxy.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+            raise HTTPException(
+                status_code=400,
+                detail="x-proxy must start with http://, https://, socks4://, or socks5://",
+            )
+
+        mirror = global_mirror or RequestMirror(global_bypasser)
+
+        # Prime the cf_clearance ONCE before fanning out. Without this, every
+        # concurrent fetch would miss the cache and try to spawn its own browser.
+        first_path, _ = split_path_query(payload.paths[0])
+        prime_url = mirror.build_target_url(hostname, first_path)
+        if bypass_cache:
+            cache_key = md5_hash(urlparse(prime_url).netloc + (proxy or ""))
+            mirror.bypasser.cookie_cache.invalidate(cache_key)
+        cf_data = await mirror.bypasser.get_or_generate_cookies(prime_url, proxy)
+        if not cf_data:
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to obtain Cloudflare clearance cookies for hostname",
+            )
+
+        logger.info(
+            f"ZonaProp batch: {len(payload.paths)} pages, concurrency={payload.concurrency}, host={hostname}"
+        )
+
+        # Mirror headers passed through to each per-page request.
+        base_headers: Dict[str, str] = {'x-hostname': hostname}
+        if proxy:
+            base_headers['x-proxy'] = proxy
+
+        semaphore = asyncio.Semaphore(payload.concurrency)
+
+        async def fetch_one(path_with_query: str) -> Dict[str, Any]:
+            page_path, query_string = split_path_query(path_with_query)
+            async with semaphore:
+                try:
+                    status_code, _resp_headers, content = await mirror.mirror_request(
+                        method="GET",
+                        path=page_path,
+                        query_string=query_string,
+                        headers=dict(base_headers),
+                        body=None,
+                    )
+                    if status_code != 200:
+                        return {
+                            "path": path_with_query,
+                            "status": "error",
+                            "status_code": status_code,
+                            "data": None,
+                            "error": f"Target returned status {status_code}",
+                        }
+                    data = extract_preloaded_state(content.decode('utf-8', errors='ignore'))
+                    return {
+                        "path": path_with_query,
+                        "status": "ok",
+                        "status_code": status_code,
+                        "data": data,
+                        "error": None,
+                    }
+                except Exception as e:
+                    return {
+                        "path": path_with_query,
+                        "status": "error",
+                        "status_code": None,
+                        "data": None,
+                        "error": str(e),
+                    }
+
+        results = await asyncio.gather(*(fetch_one(p) for p in payload.paths))
+
+        succeeded = sum(1 for r in results if r["status"] == "ok")
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        logger.info(
+            f"ZonaProp batch completed: {succeeded}/{len(results)} ok in {elapsed_ms}ms"
+        )
+
+        return JSONResponse(content={
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "elapsed_ms": elapsed_ms,
+            "results": results,
+        })
 
     @app.api_route(
         "/zonaprop/{path:path}",
@@ -162,64 +334,11 @@ def setup_routes(app: FastAPI):
                 )
 
             html_content = response_content.decode('utf-8', errors='ignore')
-            soup = BeautifulSoup(html_content, 'lxml')
-
-            script_tag = soup.find('script', id="preloadedData")
-            if not script_tag:
-                logger.error("No script tag found with id='preloadedData'")
-                raise HTTPException(
-                    status_code=404,
-                    detail="No script tag found with id='preloadedData' in the page"
-                )
-
-            script_text = script_tag.text.strip()
-
-            preloaded_state_marker = 'window.__PRELOADED_STATE__ = '
-            start_index = script_text.find(preloaded_state_marker)
-
-            if start_index == -1:
-                logger.error("window.__PRELOADED_STATE__ marker not found in script")
-                raise HTTPException(
-                    status_code=404,
-                    detail="window.__PRELOADED_STATE__ marker not found in script tag"
-                )
-
-            json_start = start_index + len(preloaded_state_marker)
-            json_text = script_text[json_start:].strip()
-
             try:
-                json_text_cleaned = json_text
-                if json_text_cleaned.endswith(';'):
-                    json_text_cleaned = json_text_cleaned[:-1]
-                preloaded_data = json.loads(json_text_cleaned)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON: {e}")
-                try:
-                    brace_count = 0
-                    json_end = 0
-                    for i, char in enumerate(json_text):
-                        if char == '{':
-                            brace_count += 1
-                        elif char == '}':
-                            brace_count -= 1
-                            if brace_count == 0:
-                                json_end = i + 1
-                                break
-
-                    if json_end > 0:
-                        json_text_cleaned = json_text[:json_end]
-                        preloaded_data = json.loads(json_text_cleaned)
-                    else:
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"Failed to extract valid JSON: {str(e)}"
-                        )
-                except Exception as parse_error:
-                    logger.error(f"Failed to parse JSON after cleanup: {parse_error}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to parse JSON from script tag: {str(parse_error)}"
-                    )
+                preloaded_data = extract_preloaded_state(html_content)
+            except ValueError as e:
+                logger.error(f"Failed to extract preloaded state: {e}")
+                raise HTTPException(status_code=502, detail=str(e))
 
             processing_time = int((time.time() - start_time) * 1000)
             logger.info(f"ZonaProp request completed successfully in {processing_time}ms")

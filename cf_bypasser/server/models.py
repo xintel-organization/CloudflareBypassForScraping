@@ -65,6 +65,46 @@ class MirrorResponse(BaseModel):
     content_type: Optional[str] = Field(None, description="Content type of response")
 
 
+class ZonapropBatchRequest(BaseModel):
+    """Request body for the parallel ZonaProp batch endpoint."""
+    paths: List[str] = Field(
+        ...,
+        min_length=1,
+        description="List of path (+ optional query string) entries to fetch, e.g. "
+                    "['departamentos-venta.html', 'departamentos-venta-pagina-2.html']",
+    )
+    concurrency: int = Field(
+        15, ge=1, le=50,
+        description="Max number of pages fetched in parallel (cf_clearance is reused across all)",
+    )
+
+    @field_validator('paths')
+    @classmethod
+    def validate_paths(cls, v):
+        cleaned = [p.strip() for p in v if p and p.strip()]
+        if not cleaned:
+            raise ValueError('paths must contain at least one non-empty entry')
+        return cleaned
+
+
+class ZonapropPageResult(BaseModel):
+    """Result for a single page within a batch."""
+    path: str = Field(..., description="The requested path")
+    status: str = Field(..., description="'ok' or 'error'")
+    status_code: Optional[int] = Field(None, description="HTTP status code from the target")
+    data: Optional[Any] = Field(None, description="Parsed __PRELOADED_STATE__ JSON (when status == 'ok')")
+    error: Optional[str] = Field(None, description="Error message (when status == 'error')")
+
+
+class ZonapropBatchResponse(BaseModel):
+    """Response for the parallel ZonaProp batch endpoint."""
+    total: int = Field(..., description="Number of pages requested")
+    succeeded: int = Field(..., description="Number of pages parsed successfully")
+    failed: int = Field(..., description="Number of pages that failed")
+    elapsed_ms: int = Field(..., description="Total wall-clock time for the batch")
+    results: List[ZonapropPageResult] = Field(..., description="Per-page results, in request order")
+
+
 class CacheStatsResponse(BaseModel):
     """Response model for cache statistics."""
     cached_entries: int = Field(..., description="Number of active cached entries")
