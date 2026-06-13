@@ -102,23 +102,13 @@ def extract_preloaded_state(html_content: str) -> Any:
     json_start = start_index + len(preloaded_state_marker)
     json_text = script_text[json_start:].strip()
 
-    json_text_cleaned = json_text[:-1] if json_text.endswith(';') else json_text
+    # Use raw_decode so trailing content after the object (e.g. ";window.X=...")
+    # is ignored. A naive brace count would miscount braces that appear inside
+    # string values (property descriptions) and truncate the JSON.
     try:
-        return json.loads(json_text_cleaned)
+        obj, _ = json.JSONDecoder().raw_decode(json_text)
+        return obj
     except json.JSONDecodeError as e:
-        # Fallback: walk braces to find the end of the first JSON object
-        brace_count = 0
-        json_end = 0
-        for i, char in enumerate(json_text):
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    json_end = i + 1
-                    break
-        if json_end > 0:
-            return json.loads(json_text[:json_end])
         raise ValueError(f"Failed to extract valid JSON: {e}")
 
 
