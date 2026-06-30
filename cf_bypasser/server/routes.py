@@ -32,11 +32,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Starting Cloudflare Bypasser Server...")
 
-    if not os.environ.get("API_TOKEN", "").strip():
-        logger.warning(
-            "API_TOKEN env var is not set — all requests will be rejected with 503. "
-            "Set API_TOKEN in your environment (e.g. docker-compose) to enable the API."
-        )
+    # if not os.environ.get("API_TOKEN", "").strip():
+    #     logger.warning(
+    #         "API_TOKEN env var is not set — all requests will be rejected with 503. "
+    #         "Set API_TOKEN in your environment (e.g. docker-compose) to enable the API."
+    #     )
 
     global_bypasser = CamoufoxBypasser(max_retries=5, log=True)
     global_mirror = RequestMirror(global_bypasser)
@@ -71,14 +71,14 @@ def is_safe_url(url: str) -> bool:
         return False
 
 
-def verify_token(x_api_token: Optional[str] = Header(None)) -> None:
-    """Validate X-API-Token header against the API_TOKEN env var (fail closed)."""
-    expected = os.environ.get("API_TOKEN", "").strip()
-    if not expected:
-        logger.error("API_TOKEN env var is not set — refusing request")
-        raise HTTPException(status_code=503, detail="Server misconfigured: API_TOKEN not set")
-    if not x_api_token or not secrets.compare_digest(x_api_token, expected):
-        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Token header")
+# def verify_token(x_api_token: Optional[str] = Header(None)) -> None:
+#     """Validate X-API-Token header against the API_TOKEN env var (fail closed)."""
+#     expected = os.environ.get("API_TOKEN", "").strip()
+#     if not expected:
+#         logger.error("API_TOKEN env var is not set — refusing request")
+#         raise HTTPException(status_code=503, detail="Server misconfigured: API_TOKEN not set")
+#     if not x_api_token or not secrets.compare_digest(x_api_token, expected):
+#         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Token header")
 
 
 def extract_preloaded_state(html_content: str) -> Any:
@@ -125,7 +125,7 @@ def split_path_query(path_with_query: str) -> tuple[str, str]:
 def setup_routes(app: FastAPI):
     """Setup routes for the FastAPI application. Only /zonaprop is exposed."""
 
-    @app.post("/zonaprop-batch", dependencies=[Depends(verify_token)])
+    @app.post("/zonaprop-batch")
     async def zonaprop_batch(request: Request, payload: ZonapropBatchRequest):
         """Fetch many ZonaProp pages in parallel, reusing a single cf_clearance.
 
@@ -133,7 +133,7 @@ def setup_routes(app: FastAPI):
         are fetched concurrently with curl_cffi up to `concurrency` at a time.
 
         Required Headers:
-        - X-API-Token, x-hostname
+        - x-hostname
         Optional Headers:
         - x-proxy, x-bypass-cache
         """
@@ -247,14 +247,12 @@ def setup_routes(app: FastAPI):
     @app.api_route(
         "/zonaprop/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-        dependencies=[Depends(verify_token)],
     )
     async def zonaprop_request(request: Request, path: str = ""):
         """
         ZonaProp-specific endpoint that extracts preloaded state JSON from the page.
 
         Required Headers:
-        - X-API-Token: Authentication token (must match server's API_TOKEN env var)
         - x-hostname: Target hostname (e.g., "zonaprop.com.ar")
 
         Optional Headers:
